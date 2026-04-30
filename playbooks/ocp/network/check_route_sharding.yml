@@ -1,7 +1,8 @@
 ---
 # =============================================================================
 # Health Check: Route Sharding
-# Valida domínio e label selector do IngressController
+# Valida domínio, label selector e disponibilidade do IngressController.
+# Publica artefatos via set_stats para o próximo job do workflow (ServiceNow).
 # =============================================================================
 - name: Health Check — Route Sharding
   hosts: localhost
@@ -19,49 +20,119 @@
         name: "{{ ingress_controller_name }}"
         namespace: openshift-ingress-operator
       register: ingress_controller
+      failed_when: false
 
-    - name: Validar que IngressController existe
-      ansible.builtin.assert:
-        that:
-          - ingress_controller.resources | length > 0
-        fail_msg: "IngressController '{{ ingress_controller_name }}' não encontrado"
-        success_msg: "IngressController '{{ ingress_controller_name }}' encontrado"
+    - name: Obter Infrastructure (nome do cluster)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+      register: infrastructure
+      failed_when: false
 
-    - name: Extrair IngressController
+    - name: Calcular fatos básicos
       ansible.builtin.set_fact:
-        ic: "{{ ingress_controller.resources[0] }}"
+        cluster_name: "{{ infrastructure.resources[0].status.infrastructureName | default('unknown') }}"
+        ic_exists: "{{ (ingress_controller.resources | default([])) | length > 0 }}"
+        ic: "{{ (ingress_controller.resources | default([{}]))[0] }}"
 
-    - name: Validar domínio do IngressController
+    - name: Avaliar resultado de cada check
+      ansible.builtin.set_fact:
+        actual_domain: "{{ ic.status.domain | default('N/A') }}"
+        actual_selector: "{{ ic.spec.routeSelector | default({}) }}"
+        domain_ok: >-
+          {{ ic_exists
+             and (ic.status.domain | default(''))
+             and (expected_route_domain in ic.status.domain) }}
+        selector_ok: >-
+          {{ (not (enforce_route_sharding | bool))
+             or (ic_exists
+                 and ic.spec.routeSelector is defined
+                 and ic.spec.routeSelector.matchLabels is defined
+                 and (ic.spec.routeSelector.matchLabels[expected_route_selector_key]
+                      | default(none)) == expected_route_selector_value) }}
+        available_ok: >-
+          {{ ic_exists
+             and (ic.status.conditions | default([])
+                  | selectattr('type', 'equalto', 'Available')
+                  | selectattr('status', 'equalto', 'True')
+                  | list | length > 0) }}
+
+    - name: Construir lista de validações com falha
+      ansible.builtin.set_fact:
+        failed_validations: >-
+          {{ (['IngressController ' ~ ingress_controller_name ~ ' não encontrado']
+              if not ic_exists else [])
+             + (['Domínio incorreto: esperado contém "' ~ expected_route_domain
+                 ~ '", atual: "' ~ actual_domain ~ '"']
+                if ic_exists and not domain_ok else [])
+             + (['routeSelector incorreto/ausente: esperado matchLabels.'
+                 ~ expected_route_selector_key ~ '=' ~ expected_route_selector_value
+                 ~ ', atual: ' ~ (actual_selector | string)]
+                if (enforce_route_sharding | bool) and ic_exists and not selector_ok else [])
+             + (['IngressController NÃO está Available']
+                if ic_exists and not available_ok else []) }}
+
+    - name: Relatório final do Route Sharding
+      ansible.builtin.debug:
+        msg: |
+          ======================== ROUTE SHARDING REPORT ========================
+          Cluster              : {{ cluster_name }}
+          IngressController    : {{ ingress_controller_name }}
+          Existe               : {{ 'SIM' if ic_exists else 'NÃO' }}
+          {% if ic_exists %}
+          Domínio atual        : {{ actual_domain }}
+          Domínio esperado     : {{ expected_route_domain }}
+          Domínio match        : {{ 'OK' if domain_ok else 'INCORRETO' }}
+          Available            : {{ 'SIM' if available_ok else 'NÃO' }}
+          --------------------------------------------------------------------------
+          Sharding enforce     : {{ enforce_route_sharding }}
+          Selector esperado    : {{ expected_route_selector_key }}={{ expected_route_selector_value }}
+          Selector atual       : {{ actual_selector }}
+          Selector match       : {{ 'OK' if selector_ok else ('INCORRETO/AUSENTE' if (enforce_route_sharding | bool) else 'IGNORADO (enforce=false)') }}
+          {% endif %}
+          --------------------------------------------------------------------------
+          Falhas detectadas    : {{ failed_validations | length }}
+          {% for f in failed_validations %}
+            - {{ f }}
+          {% endfor %}
+          ========================================================================
+
+    - name: Publicar artefatos para o próximo job do workflow (ServiceNow)
+      ansible.builtin.set_stats:
+        data:
+          incident_required: "{{ failed_validations | length > 0 }}"
+          cluster_name: "{{ cluster_name }}"
+          failed_validations_list: "{{ failed_validations }}"
+          sn_short_description: >-
+            {%- if failed_validations | length > 0 -%}
+            [OCP {{ cluster_name }}] Route Sharding com inconsistência(s) no IngressController '{{ ingress_controller_name }}'
+            {%- else -%}
+            [OCP {{ cluster_name }}] Route Sharding OK no IngressController '{{ ingress_controller_name }}'
+            {%- endif -%}
+          sn_description: |-
+            Cluster: {{ cluster_name }}
+            IngressController: {{ ingress_controller_name }}
+            {% if failed_validations | length > 0 %}
+            Inconsistências detectadas:
+            {% for f in failed_validations %}
+            - {{ f }}
+            {% endfor %}
+
+            Ação: revisar configuração do IngressController '{{ ingress_controller_name }}'
+            no namespace openshift-ingress-operator.
+            {% else %}
+            Todas as validações de Route Sharding passaram.
+            {% endif %}
+            Verificação executada via AAP (Health Check OCP).
+          sn_impact: "medium"
+          sn_urgency: "medium"
+
+    - name: Falhar se houver validações com problema
       ansible.builtin.assert:
         that:
-          - ic.status.domain is defined
-          - expected_route_domain in ic.status.domain
+          - failed_validations | length == 0
         fail_msg: >-
-          Domínio esperado '{{ expected_route_domain }}' não encontrado.
-          Domínio atual: {{ ic.status.domain | default('indefinido') }}
-        success_msg: "Domínio correto: {{ ic.status.domain }}"
-
-    - name: Validar routeSelector do IngressController
-      ansible.builtin.assert:
-        that:
-          - ic.spec.routeSelector is defined
-          - ic.spec.routeSelector.matchLabels is defined
-          - ic.spec.routeSelector.matchLabels[expected_route_selector_key] is defined
-          - ic.spec.routeSelector.matchLabels[expected_route_selector_key] == expected_route_selector_value
-        fail_msg: >-
-          routeSelector esperado: {{ expected_route_selector_key }}={{ expected_route_selector_value }}.
-          Atual: {{ ic.spec.routeSelector | default('não definido') }}
-        success_msg: >-
-          routeSelector correto:
-          {{ expected_route_selector_key }}={{ expected_route_selector_value }}
-      when: expected_route_selector_key is defined and expected_route_selector_key | length > 0
-
-    - name: Validar que IngressController está Available
-      ansible.builtin.assert:
-        that:
-          - ic.status.conditions
-            | selectattr('type', 'equalto', 'Available')
-            | selectattr('status', 'equalto', 'True')
-            | list | length > 0
-        fail_msg: "IngressController '{{ ingress_controller_name }}' NÃO está Available"
-        success_msg: "IngressController '{{ ingress_controller_name }}' está Available"
+          {{ failed_validations | length }} validação(ões) de Route Sharding falharam.
+          Veja o relatório acima.
+        success_msg: "Todas as validações de Route Sharding passaram"

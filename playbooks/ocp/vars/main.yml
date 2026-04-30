@@ -36,6 +36,9 @@ required_agents:
 
 # --- Rede / Segurança (L7) ---
 # Route Sharding
+# Se true, exige routeSelector.matchLabels com a chave/valor configurados.
+# Defina false em clusters sem sharding por label (ex: HyperShift sem shards custom).
+enforce_route_sharding: true
 expected_route_domain: "apps.example.com"
 ingress_controller_name: "default"
 expected_route_selector_key: "type"
