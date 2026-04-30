@@ -1,0 +1,41 @@
+---
+# =============================================================================
+# Tasks para validação de um único agente
+# Espera as variáveis: agent.name, agent.namespace, agent.label_selector
+# Acumula resultado em agent_results (lista de dicts)
+# =============================================================================
+- name: "Obter pods do agente {{ agent.name }}"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ agent.namespace }}"
+    label_selectors:
+      - "{{ agent.label_selector }}"
+  register: agent_pods
+
+- name: "Validar que existem pods do {{ agent.name }}"
+  ansible.builtin.assert:
+    that:
+      - agent_pods.resources | length > 0
+    fail_msg: "Nenhum pod encontrado para {{ agent.name }} no namespace {{ agent.namespace }}"
+    success_msg: "{{ agent_pods.resources | length }} pod(s) encontrado(s) para {{ agent.name }}"
+
+- name: "Validar que pods do {{ agent.name }} estão Running"
+  ansible.builtin.assert:
+    that:
+      - item.status.phase == 'Running'
+    fail_msg: "Pod {{ item.metadata.name }} do {{ agent.name }} está {{ item.status.phase }}, esperado Running"
+    success_msg: "Pod {{ item.metadata.name }} do {{ agent.name }} está Running"
+  loop: "{{ agent_pods.resources }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+
+- name: "Acumular resultado do {{ agent.name }} no relatório"
+  ansible.builtin.set_fact:
+    agent_results: "{{ agent_results | default([]) + [single_result] }}"
+  vars:
+    single_result:
+      name: "{{ agent.name }}"
+      namespace: "{{ agent.namespace }}"
+      pod_count: "{{ agent_pods.resources | length }}"
+      pods: "{{ agent_pods.resources | map(attribute='metadata.name') | list }}"
+      all_running: "{{ agent_pods.resources | map(attribute='status.phase') | list | unique == ['Running'] }}"
