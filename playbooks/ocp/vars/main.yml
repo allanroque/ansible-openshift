@@ -48,8 +48,19 @@ expected_route_selector_value: "sharded"
 # Namespace da aplicação
 app_namespace: "my-app"
 
-# Banco de dados — Secret
+# --- Banco de dados (cluster-wide scan de Secrets) ---
+# Filtrar por namespace específico (vazio = todos)
+db_namespace_filter: ""
+# Excluir namespaces de sistema (openshift-*, kube-*, default)
+db_exclude_system_namespaces: true
+# Nome do Secret a procurar (cada namespace pode ter no máximo um com esse nome)
 db_secret_name: "db-credentials"
+# Chaves obrigatórias dentro do Secret (lista separada por vírgula)
+db_required_keys: "username,password"
+# Se true, falha o playbook quando há Secrets com problema
+enforce_db_check: true
+
+# (Legado, ainda usado por outros playbooks)
 db_secret_namespace: "{{ app_namespace }}"
 
 # External Secrets Operator (ESO)

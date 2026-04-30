@@ -1,9 +1,12 @@
 ---
 # =============================================================================
-# Health Check: Database Secret
-# Valida que o Secret do banco de dados existe e contém as chaves esperadas
+# Health Check: Database Secrets (cluster-wide scan)
+# Procura Secrets por nome em todos os namespaces (ou filtrado) e valida
+# que cada um contém as chaves obrigatórias.
+# Status por Secret: OK | EMPTY | MISSING_KEYS
+# Publica artefatos via set_stats para o próximo job do workflow (ServiceNow).
 # =============================================================================
-- name: Health Check — Database Secret
+- name: Health Check — Database Secrets (cluster-wide)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -12,28 +15,130 @@
     - ../vars/main.yml
 
   tasks:
-    - name: Obter Secret do banco de dados
+    - name: Obter Infrastructure (nome do cluster)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+      register: infrastructure
+      failed_when: false
+
+    - name: "Buscar Secrets com nome '{{ db_secret_name }}' (server-side filter)"
       kubernetes.core.k8s_info:
         kind: Secret
-        name: "{{ db_secret_name }}"
-        namespace: "{{ db_secret_namespace }}"
-      register: db_secret
+        namespace: "{{ db_namespace_filter if (db_namespace_filter | length > 0) else omit }}"
+        field_selectors:
+          - "metadata.name={{ db_secret_name }}"
+      register: db_secrets_raw
 
-    - name: Validar que Secret do banco existe
+    - name: Filtrar (excluir namespaces de sistema se configurado)
+      ansible.builtin.set_fact:
+        cluster_name: "{{ infrastructure.resources[0].status.infrastructureName | default('unknown') }}"
+        candidate_secrets: >-
+          {{ db_secrets_raw.resources
+             | rejectattr('metadata.namespace', 'match',
+                          '^(openshift|kube|default)([-.]|$)'
+                          if (db_exclude_system_namespaces | bool)
+                          else '$.^')
+             | list }}
+        db_report: []
+        db_required_keys_list: >-
+          {{ db_required_keys | split(',') | map('trim') | list }}
+
+    - name: Avaliar cada Secret encontrado
+      ansible.builtin.include_tasks: tasks/check_db_secret.yml
+      loop: "{{ candidate_secrets }}"
+      loop_control:
+        loop_var: sec
+        label: "{{ sec.metadata.namespace }}/{{ sec.metadata.name }}"
+
+    - name: Calcular Secrets com problema
+      ansible.builtin.set_fact:
+        problematic: >-
+          {{ db_report
+             | selectattr('status', 'in', ['EMPTY', 'MISSING_KEYS'])
+             | list }}
+
+    - name: Calcular contagens por status
+      ansible.builtin.set_fact:
+        count_ok: "{{ db_report | selectattr('status','equalto','OK') | list | length }}"
+        count_empty: "{{ db_report | selectattr('status','equalto','EMPTY') | list | length }}"
+        count_missing: "{{ db_report | selectattr('status','equalto','MISSING_KEYS') | list | length }}"
+
+    - name: Relatório final dos Database Secrets
+      ansible.builtin.debug:
+        msg: |
+          ============== DATABASE SECRETS HEALTH REPORT ==============
+          Cluster              : {{ cluster_name }}
+          Secret name          : {{ db_secret_name }}
+          Required keys        : {{ db_required_keys_list }}
+          Namespace filter     : {{ db_namespace_filter | default('(todos)') or '(todos)' }}
+          Excluir system NS    : {{ db_exclude_system_namespaces }}
+          Secrets encontrados  : {{ db_report | length }}
+          --------------------------------------------------------------
+          OK            : {{ count_ok }}
+          EMPTY         : {{ count_empty }}
+          MISSING_KEYS  : {{ count_missing }}
+          --------------------------------------------------------------
+          {% for r in db_report %}
+          [{{ r.status }}] {{ r.namespace }}/{{ r.name }}
+            Keys presentes : {{ r.keys }}
+          {% if r.missing_keys %}
+            Keys faltando  : {{ r.missing_keys }}
+          {% endif %}
+          {% if r.issue %}
+            Issue          : {{ r.issue }}
+          {% endif %}
+          {% endfor %}
+          ==============================================================
+
+    - name: Publicar artefatos para o próximo job do workflow (ServiceNow)
+      ansible.builtin.set_stats:
+        data:
+          incident_required: "{{ problematic | length > 0 }}"
+          cluster_name: "{{ cluster_name }}"
+          problematic_secrets: >-
+            {{ problematic | map(attribute='namespace')
+               | zip(problematic | map(attribute='name'))
+               | map('join', '/') | list }}
+          sn_short_description: >-
+            {%- if problematic | length > 0 -%}
+            [OCP {{ cluster_name }}] {{ problematic | length }} Secret(s) de DB com problema
+            {%- else -%}
+            [OCP {{ cluster_name }}] Database Secrets OK ({{ count_ok }} encontrados)
+            {%- endif -%}
+          sn_description: |-
+            Cluster: {{ cluster_name }}
+            Secret name: {{ db_secret_name }}
+            Required keys: {{ db_required_keys_list | join(', ') }}
+            Resumo:
+              OK: {{ count_ok }} | EMPTY: {{ count_empty }} | MISSING_KEYS: {{ count_missing }}
+            {% if problematic | length > 0 %}
+
+            Secrets com problema:
+            {% for r in problematic %}
+            - [{{ r.status }}] {{ r.namespace }}/{{ r.name }}
+              {% if r.issue %}{{ r.issue }}{% endif %}
+            {% endfor %}
+
+            Ação: revisar/recriar os Secrets acima com as chaves obrigatórias.
+            {% else %}
+            {% if db_report | length == 0 %}
+            Nenhum Secret '{{ db_secret_name }}' encontrado nos namespaces alvo.
+            {% else %}
+            Todos os Secrets encontrados estão saudáveis.
+            {% endif %}
+            {% endif %}
+            Verificação executada via AAP (Health Check OCP).
+          sn_impact: "medium"
+          sn_urgency: "medium"
+
+    - name: Falhar se enforce=true e há Secrets com problema
       ansible.builtin.assert:
         that:
-          - db_secret.resources | length > 0
+          - problematic | length == 0
         fail_msg: >-
-          Secret '{{ db_secret_name }}' não encontrado
-          no namespace '{{ db_secret_namespace }}'
-        success_msg: >-
-          Secret '{{ db_secret_name }}' encontrado
-          no namespace '{{ db_secret_namespace }}'
-
-    - name: Validar que Secret contém dados
-      ansible.builtin.assert:
-        that:
-          - db_secret.resources[0].data is defined
-          - db_secret.resources[0].data | length > 0
-        fail_msg: "Secret '{{ db_secret_name }}' existe mas está vazio"
-        success_msg: "Secret '{{ db_secret_name }}' contém {{ db_secret.resources[0].data | length }} chave(s)"
+          {{ problematic | length }} Secret(s) de DB com problema.
+          Veja o relatório acima.
+        success_msg: "Todos os Database Secrets encontrados estão saudáveis"
+      when: enforce_db_check | bool
