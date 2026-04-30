@@ -1,0 +1,151 @@
+---
+# =============================================================================
+# Avalia o certificado de uma única Route.
+# Espera: rt (a Route) e cert_min_days_remaining (int).
+# Acumula em cert_report (lista de dicts) com {namespace, name, host,
+# termination, cert_source, cn, not_after, expires_in, status, issue}.
+# =============================================================================
+- name: "Reset de estado para {{ rt.metadata.namespace }}/{{ rt.metadata.name }}"
+  ansible.builtin.set_fact:
+    cert_pem: ""
+    cert_status: ""
+    cert_issue: ""
+    cert_source: ""
+    cert_cn: ""
+    cert_sans: []
+    cert_not_after: ""
+    cert_expires_in: ""
+    rt_termination: "{{ rt.spec.tls.termination | default('') }}"
+    rt_host: "{{ rt.spec.host | default('N/A') }}"
+
+- name: "Caso passthrough: cert no pod, não validável"
+  ansible.builtin.set_fact:
+    cert_status: "PASSTHROUGH"
+    cert_source: "pod (passthrough)"
+  when: rt_termination == 'passthrough'
+
+- name: "Buscar certificado inline (spec.tls.certificate)"
+  ansible.builtin.set_fact:
+    cert_pem: "{{ rt.spec.tls.certificate }}"
+    cert_source: "inline"
+  when:
+    - cert_status == ''
+    - rt_termination in ['edge', 'reencrypt']
+    - rt.spec.tls.certificate is defined
+    - rt.spec.tls.certificate | length > 0
+
+- name: "Buscar Secret externo (spec.tls.externalCertificate.name)"
+  when:
+    - cert_status == ''
+    - cert_pem | length == 0
+    - rt_termination in ['edge', 'reencrypt']
+    - rt.spec.tls.externalCertificate is defined
+    - rt.spec.tls.externalCertificate.name is defined
+  block:
+    - name: "Obter Secret externo"
+      kubernetes.core.k8s_info:
+        kind: Secret
+        namespace: "{{ rt.metadata.namespace }}"
+        name: "{{ rt.spec.tls.externalCertificate.name }}"
+      register: ext_secret
+      failed_when: false
+
+    - name: "Extrair cert do Secret"
+      ansible.builtin.set_fact:
+        cert_pem: "{{ ext_secret.resources[0].data['tls.crt'] | b64decode }}"
+        cert_source: "secret/{{ rt.spec.tls.externalCertificate.name }}"
+      when:
+        - ext_secret.resources is defined
+        - (ext_secret.resources | length) > 0
+        - ext_secret.resources[0].data['tls.crt'] is defined
+
+- name: "Default cert do cluster (sem cert custom na route)"
+  ansible.builtin.set_fact:
+    cert_status: "DEFAULT_CERT"
+    cert_source: "default cluster cert"
+  when:
+    - cert_status == ''
+    - cert_pem | length == 0
+    - rt_termination in ['edge', 'reencrypt']
+
+- name: "Parsear x509 e calcular status"
+  when:
+    - cert_status == ''
+    - cert_pem | length > 0
+  block:
+    - name: "Parsear x509 certificate info"
+      community.crypto.x509_certificate_info:
+        content: "{{ cert_pem }}"
+      register: cert_info_result
+
+    - name: "Extrair CN, SANs e not_after"
+      ansible.builtin.set_fact:
+        cert_cn: "{{ cert_info_result.subject.commonName | default('') }}"
+        cert_sans: >-
+          {{ cert_info_result.subject_alt_name | default([])
+             | map('regex_replace', '^DNS:', '') | list }}
+        cert_not_after: "{{ cert_info_result.not_after | default('') }}"
+
+    - name: "Calcular dias até expiração"
+      ansible.builtin.set_fact:
+        cert_expires_in: >-
+          {{ ((cert_not_after | to_datetime('%Y%m%d%H%M%SZ'))
+              - now(utc=true)).days }}
+      when: cert_not_after | length > 0
+
+    - name: "Calcular se host bate com CN ou SANs (com expansão de wildcard)"
+      ansible.builtin.set_fact:
+        host_match: >-
+          {{ rt_host in (([cert_cn] + cert_sans)
+                        | map('regex_replace', '^\*',
+                              rt_host.split('.')[0])
+                        | list) }}
+
+    - name: "Computar status final do certificado"
+      ansible.builtin.set_fact:
+        cert_status: >-
+          {%- if (cert_expires_in | int(default=-1)) < 0 -%}
+          EXPIRED
+          {%- elif (cert_expires_in | int) < (cert_min_days_remaining | int) -%}
+          EXPIRING_SOON
+          {%- elif not host_match -%}
+          CN_MISMATCH
+          {%- else -%}
+          OK
+          {%- endif -%}
+        cert_issue: >-
+          {%- if (cert_expires_in | int(default=-1)) < 0 -%}
+          Certificado EXPIRADO em {{ cert_not_after }}
+          {%- elif (cert_expires_in | int) < (cert_min_days_remaining | int) -%}
+          Expira em {{ cert_expires_in }} dias ({{ cert_not_after }})
+          {%- elif not host_match -%}
+          CN/SAN não cobre o host '{{ rt_host }}' (CN={{ cert_cn }}, SANs={{ cert_sans }})
+          {%- else -%}{%- endif -%}
+
+  rescue:
+    - name: "Erro ao parsear certificado"
+      ansible.builtin.set_fact:
+        cert_status: "PARSE_ERROR"
+        cert_issue: "Não foi possível parsear o certificado (community.crypto/cryptography ausente?)"
+
+- name: "Default se ainda sem status (TLS sem cert encontrado)"
+  ansible.builtin.set_fact:
+    cert_status: "MISSING_CERT"
+    cert_issue: "TLS configurado mas certificado não foi localizado"
+  when: cert_status == ''
+
+- name: "Acumular no relatório"
+  ansible.builtin.set_fact:
+    cert_report: "{{ cert_report + [entry] }}"
+  vars:
+    entry:
+      namespace: "{{ rt.metadata.namespace }}"
+      name: "{{ rt.metadata.name }}"
+      host: "{{ rt_host }}"
+      termination: "{{ rt_termination }}"
+      cert_source: "{{ cert_source }}"
+      cn: "{{ cert_cn }}"
+      not_after: "{{ cert_not_after }}"
+      expires_in: "{{ cert_expires_in }}"
+      status: "{{ cert_status }}"
+      issue: "{{ cert_issue }}"

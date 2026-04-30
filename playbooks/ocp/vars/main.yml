@@ -64,14 +64,15 @@ app_route_namespace: "{{ app_namespace }}"
 app_url: "https://my-app.apps.example.com"
 expected_http_status: 200
 
-# --- Certificados SSL ---
-# Route cujo certificado será validado
-certificate_route_name: "{{ app_route_name }}"
-certificate_route_namespace: "{{ app_route_namespace }}"
-# CN esperado no certificado (deixar vazio para pular validação de CN)
-expected_certificate_cn: "my-app.apps.example.com"
-# Dias mínimos antes da expiração para considerar válido
-certificate_min_days_remaining: 30
+# --- Certificados SSL (cluster-wide scan) ---
+# Filtra por namespace específico (vazio = todos)
+cert_namespace_filter: ""
+# Excluir namespaces de sistema (openshift-*, kube-*, default)
+cert_exclude_system_namespaces: true
+# Alerta se cert expira em menos de N dias
+cert_min_days_remaining: 30
+# Se true, falha o playbook quando há routes com problema
+enforce_certificate_check: true
 
 # --- Headers / Segurança ---
 # URL para testar manipulação de headers

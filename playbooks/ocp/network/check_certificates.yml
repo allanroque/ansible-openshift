@@ -1,13 +1,12 @@
 ---
 # =============================================================================
-# Health Check: Certificados SSL
-# Valida TLS na Route, presença do certificado e conexão HTTPS válida
-#
-# Nota: a validação de CN e datas de expiração depende do módulo
-# community.crypto.x509_certificate_info. Se não disponível, o playbook
-# valida via k8s_info (Route/Secret) e uri (conexão TLS).
+# Health Check: Certificados SSL (cluster-wide scan)
+# Lê todas as Routes com TLS, parseia o cert e classifica cada uma:
+#   OK | EXPIRING_SOON | EXPIRED | CN_MISMATCH | MISSING_CERT
+#   PASSTHROUGH | DEFAULT_CERT | PARSE_ERROR
+# Publica artefatos via set_stats para o próximo job do workflow (ServiceNow).
 # =============================================================================
-- name: Health Check — Certificados SSL
+- name: Health Check — Certificados SSL (cluster-wide)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -16,156 +15,141 @@
     - ../vars/main.yml
 
   tasks:
-    # -----------------------------------------------------------------
-    # 1. Validar que Route existe e tem TLS
-    # -----------------------------------------------------------------
-    - name: Obter Route com certificado
+    - name: Obter Infrastructure (nome do cluster)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+      register: infrastructure
+      failed_when: false
+
+    - name: Obter Routes (cluster-wide ou por namespace)
       kubernetes.core.k8s_info:
         api_version: route.openshift.io/v1
         kind: Route
-        name: "{{ certificate_route_name }}"
-        namespace: "{{ certificate_route_namespace }}"
-      register: route_result
+        namespace: "{{ cert_namespace_filter if (cert_namespace_filter | length > 0) else omit }}"
+      register: all_routes
 
-    - name: Validar que Route existe
-      ansible.builtin.assert:
-        that:
-          - route_result.resources | length > 0
-        fail_msg: >-
-          Route '{{ certificate_route_name }}' não encontrada
-          no namespace '{{ certificate_route_namespace }}'
-
-    - name: Extrair Route
+    - name: Filtrar routes com TLS (e excluir namespaces de sistema se configurado)
       ansible.builtin.set_fact:
-        route: "{{ route_result.resources[0] }}"
+        cluster_name: "{{ infrastructure.resources[0].status.infrastructureName | default('unknown') }}"
+        candidate_routes: >-
+          {{ all_routes.resources
+             | selectattr('spec.tls', 'defined')
+             | rejectattr('metadata.namespace', 'match',
+                          '^(openshift|kube|default)([-.]|$)'
+                          if (cert_exclude_system_namespaces | bool)
+                          else '$.^')
+             | list }}
+        cert_report: []
 
-    - name: Validar que Route possui TLS configurado
-      ansible.builtin.assert:
-        that:
-          - route.spec.tls is defined
-        fail_msg: "Route '{{ certificate_route_name }}' não possui configuração TLS"
-        success_msg: >-
-          Route '{{ certificate_route_name }}' possui TLS
-          tipo {{ route.spec.tls.termination | default('não definido') }}
+    - name: Avaliar certificado de cada route
+      ansible.builtin.include_tasks: tasks/check_route_certificate.yml
+      loop: "{{ candidate_routes }}"
+      loop_control:
+        loop_var: rt
+        label: "{{ rt.metadata.namespace }}/{{ rt.metadata.name }}"
 
-    # -----------------------------------------------------------------
-    # 2. Validar presença do certificado na Route (edge/reencrypt)
-    # -----------------------------------------------------------------
-    - name: Validar certificado na Route (edge/reencrypt)
-      when: route.spec.tls.termination | default('') in ['edge', 'reencrypt']
-      block:
-        - name: Verificar presença do certificado inline
-          ansible.builtin.assert:
-            that:
-              - route.spec.tls.certificate is defined or route.spec.tls.destinationCACertificate is defined
-            fail_msg: "Nenhum certificado encontrado na configuração TLS da Route"
-            success_msg: "Certificado presente na configuração TLS da Route"
+    - name: Calcular routes com problema
+      ansible.builtin.set_fact:
+        problematic: >-
+          {{ cert_report
+             | selectattr('status', 'in', ['EXPIRED', 'EXPIRING_SOON',
+                                            'CN_MISMATCH', 'MISSING_CERT',
+                                            'PARSE_ERROR'])
+             | list }}
 
-    # -----------------------------------------------------------------
-    # 3. Buscar Secrets TLS no namespace (cert-manager / manual)
-    # -----------------------------------------------------------------
-    - name: Buscar Secrets de tipo TLS no namespace
-      kubernetes.core.k8s_info:
-        kind: Secret
-        namespace: "{{ certificate_route_namespace }}"
-        field_selectors:
-          - type=kubernetes.io/tls
-      register: tls_secrets
+    - name: Calcular contagens por status
+      ansible.builtin.set_fact:
+        count_ok: "{{ cert_report | selectattr('status','equalto','OK') | list | length }}"
+        count_expiring: "{{ cert_report | selectattr('status','equalto','EXPIRING_SOON') | list | length }}"
+        count_expired: "{{ cert_report | selectattr('status','equalto','EXPIRED') | list | length }}"
+        count_cn_mismatch: "{{ cert_report | selectattr('status','equalto','CN_MISMATCH') | list | length }}"
+        count_missing: "{{ cert_report | selectattr('status','equalto','MISSING_CERT') | list | length }}"
+        count_passthrough: "{{ cert_report | selectattr('status','equalto','PASSTHROUGH') | list | length }}"
+        count_default: "{{ cert_report | selectattr('status','equalto','DEFAULT_CERT') | list | length }}"
+        count_parse_error: "{{ cert_report | selectattr('status','equalto','PARSE_ERROR') | list | length }}"
 
-    - name: Exibir Secrets TLS encontrados
+    - name: Relatório final dos certificados
       ansible.builtin.debug:
-        msg: >-
-          {{ tls_secrets.resources | length }} Secret(s) TLS encontrado(s):
-          {{ tls_secrets.resources | map(attribute='metadata.name') | list }}
+        msg: |
+          ============== CERTIFICATE HEALTH REPORT ==============
+          Cluster              : {{ cluster_name }}
+          Namespace filter     : {{ cert_namespace_filter | default('(todos)') or '(todos)' }}
+          Excluir system NS    : {{ cert_exclude_system_namespaces }}
+          Min days remaining   : {{ cert_min_days_remaining }}
+          Routes c/ TLS analisadas: {{ cert_report | length }}
+          --------------------------------------------------------
+          OK              : {{ count_ok }}
+          EXPIRING_SOON   : {{ count_expiring }}
+          EXPIRED         : {{ count_expired }}
+          CN_MISMATCH     : {{ count_cn_mismatch }}
+          MISSING_CERT    : {{ count_missing }}
+          PASSTHROUGH     : {{ count_passthrough }}
+          DEFAULT_CERT    : {{ count_default }}
+          PARSE_ERROR     : {{ count_parse_error }}
+          --------------------------------------------------------
+          {% for r in cert_report %}
+          [{{ r.status }}] {{ r.namespace }}/{{ r.name }}
+            Host        : {{ r.host }}
+            Termination : {{ r.termination or '(none)' }}
+            Cert source : {{ r.cert_source or 'N/A' }}
+          {% if r.cn %}
+            CN          : {{ r.cn }}
+          {% endif %}
+          {% if r.expires_in not in ['', none] %}
+            Expira em   : {{ r.expires_in }} dias ({{ r.not_after }})
+          {% endif %}
+          {% if r.issue %}
+            Issue       : {{ r.issue }}
+          {% endif %}
+          {% endfor %}
+          ========================================================
 
-    - name: Validar que existe pelo menos um Secret TLS
+    - name: Publicar artefatos para o próximo job do workflow (ServiceNow)
+      ansible.builtin.set_stats:
+        data:
+          incident_required: "{{ problematic | length > 0 }}"
+          cluster_name: "{{ cluster_name }}"
+          problematic_routes: "{{ problematic | map(attribute='namespace') | zip(problematic | map(attribute='name')) | map('join', '/') | list }}"
+          sn_short_description: >-
+            {%- if problematic | length > 0 -%}
+            [OCP {{ cluster_name }}] {{ problematic | length }} route(s) com problema de certificado
+            {%- else -%}
+            [OCP {{ cluster_name }}] Certificados OK ({{ count_ok }} routes validadas)
+            {%- endif -%}
+          sn_description: |-
+            Cluster: {{ cluster_name }}
+            Total de routes com TLS: {{ cert_report | length }}
+            Resumo:
+              OK: {{ count_ok }} | EXPIRING_SOON: {{ count_expiring }} | EXPIRED: {{ count_expired }}
+              CN_MISMATCH: {{ count_cn_mismatch }} | MISSING_CERT: {{ count_missing }}
+              PASSTHROUGH: {{ count_passthrough }} | DEFAULT_CERT: {{ count_default }}
+              PARSE_ERROR: {{ count_parse_error }}
+            {% if problematic | length > 0 %}
+
+            Routes com problema:
+            {% for r in problematic %}
+            - [{{ r.status }}] {{ r.namespace }}/{{ r.name }}
+              Host: {{ r.host }}
+              {% if r.expires_in not in ['', none] %}Expira em {{ r.expires_in }} dias ({{ r.not_after }}){% endif %}
+              {% if r.issue %}{{ r.issue }}{% endif %}
+            {% endfor %}
+
+            Ação: revisar/renovar os certificados das routes acima.
+            {% else %}
+            Todos os certificados estão saudáveis.
+            {% endif %}
+            Verificação executada via AAP (Health Check OCP).
+          sn_impact: "medium"
+          sn_urgency: "medium"
+
+    - name: Falhar se enforce=true e há routes com problema
       ansible.builtin.assert:
         that:
-          - tls_secrets.resources | length > 0
+          - problematic | length == 0
         fail_msg: >-
-          Nenhum Secret TLS encontrado no namespace '{{ certificate_route_namespace }}'
-        success_msg: >-
-          {{ tls_secrets.resources | length }} Secret(s) TLS encontrado(s)
-      when: route.spec.tls.termination | default('') != 'passthrough'
-
-    # -----------------------------------------------------------------
-    # 4. Validar certificado via community.crypto (CN + validade)
-    #    Requer: pip install cryptography
-    #    Collection: community.crypto
-    # -----------------------------------------------------------------
-    - name: Validar CN e validade do certificado (community.crypto)
-      when:
-        - tls_secrets.resources | length > 0
-        - route.spec.tls.termination | default('') != 'passthrough'
-      block:
-        - name: Decodificar certificado do primeiro Secret TLS
-          ansible.builtin.set_fact:
-            cert_pem: "{{ tls_secrets.resources[0].data['tls.crt'] | b64decode }}"
-
-        - name: Obter informações do certificado
-          community.crypto.x509_certificate_info:
-            content: "{{ cert_pem }}"
-          register: cert_info
-          ignore_errors: true
-
-        - name: Validar CN do certificado
-          ansible.builtin.assert:
-            that:
-              - expected_certificate_cn in cert_info.subject.commonName | default('')
-                or cert_info.subject_alt_name | default([])
-                   | select('match', 'DNS:' + expected_certificate_cn)
-                   | list | length > 0
-            fail_msg: >-
-              CN esperado '{{ expected_certificate_cn }}'.
-              CN atual: {{ cert_info.subject.commonName | default('N/A') }}.
-              SANs: {{ cert_info.subject_alt_name | default([]) }}
-            success_msg: "CN do certificado válido: {{ cert_info.subject.commonName | default('N/A') }}"
-          when:
-            - cert_info is not failed
-            - expected_certificate_cn | length > 0
-
-        - name: Calcular dias restantes até expiração
-          ansible.builtin.set_fact:
-            cert_days_remaining: >-
-              {{ ((cert_info.not_after | to_datetime('%Y%m%d%H%M%SZ')) -
-                  (ansible_date_time.iso8601 | default(now()) | to_datetime('%Y-%m-%dT%H:%M:%S%z'))).days
-                 | default(0) }}
-          when: cert_info is not failed
-          ignore_errors: true
-
-        - name: Exibir validade do certificado
-          ansible.builtin.debug:
-            msg: >-
-              Certificado válido de {{ cert_info.not_before | default('N/A') }}
-              até {{ cert_info.not_after | default('N/A') }}
-          when: cert_info is not failed
-
-      rescue:
-        - name: Aviso — community.crypto não disponível
-          ansible.builtin.debug:
-            msg: >-
-              AVISO: Não foi possível validar CN/validade do certificado.
-              Instale a collection community.crypto e o pacote cryptography:
-              ansible-galaxy collection install community.crypto &&
-              pip install cryptography
-
-    # -----------------------------------------------------------------
-    # 5. Validar conexão TLS ao endpoint (teste final)
-    # -----------------------------------------------------------------
-    - name: Validar conexão HTTPS ao endpoint
-      ansible.builtin.uri:
-        url: "https://{{ route.spec.host }}"
-        method: HEAD
-        return_content: false
-        validate_certs: true
-      register: ssl_check
-      ignore_errors: true
-
-    - name: Validar que conexão TLS foi estabelecida
-      ansible.builtin.assert:
-        that:
-          - ssl_check is not failed
-        fail_msg: >-
-          Falha na conexão TLS com {{ route.spec.host }}.
-          Erro: {{ ssl_check.msg | default('desconhecido') }}
-        success_msg: "Conexão TLS com {{ route.spec.host }} estabelecida com sucesso"
+          {{ problematic | length }} route(s) com problema de certificado.
+          Veja o relatório acima.
+        success_msg: "Todas as routes com TLS estão saudáveis"
+      when: enforce_certificate_check | bool
