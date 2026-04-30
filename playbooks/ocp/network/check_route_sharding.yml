@@ -1,0 +1,67 @@
+---
+# =============================================================================
+# Health Check: Route Sharding
+# Valida domínio e label selector do IngressController
+# =============================================================================
+- name: Health Check — Route Sharding
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/main.yml
+
+  tasks:
+    - name: Obter IngressController
+      kubernetes.core.k8s_info:
+        api_version: operator.openshift.io/v1
+        kind: IngressController
+        name: "{{ ingress_controller_name }}"
+        namespace: openshift-ingress-operator
+      register: ingress_controller
+
+    - name: Validar que IngressController existe
+      ansible.builtin.assert:
+        that:
+          - ingress_controller.resources | length > 0
+        fail_msg: "IngressController '{{ ingress_controller_name }}' não encontrado"
+        success_msg: "IngressController '{{ ingress_controller_name }}' encontrado"
+
+    - name: Extrair IngressController
+      ansible.builtin.set_fact:
+        ic: "{{ ingress_controller.resources[0] }}"
+
+    - name: Validar domínio do IngressController
+      ansible.builtin.assert:
+        that:
+          - ic.status.domain is defined
+          - expected_route_domain in ic.status.domain
+        fail_msg: >-
+          Domínio esperado '{{ expected_route_domain }}' não encontrado.
+          Domínio atual: {{ ic.status.domain | default('indefinido') }}
+        success_msg: "Domínio correto: {{ ic.status.domain }}"
+
+    - name: Validar routeSelector do IngressController
+      ansible.builtin.assert:
+        that:
+          - ic.spec.routeSelector is defined
+          - ic.spec.routeSelector.matchLabels is defined
+          - ic.spec.routeSelector.matchLabels[expected_route_selector_key] is defined
+          - ic.spec.routeSelector.matchLabels[expected_route_selector_key] == expected_route_selector_value
+        fail_msg: >-
+          routeSelector esperado: {{ expected_route_selector_key }}={{ expected_route_selector_value }}.
+          Atual: {{ ic.spec.routeSelector | default('não definido') }}
+        success_msg: >-
+          routeSelector correto:
+          {{ expected_route_selector_key }}={{ expected_route_selector_value }}
+      when: expected_route_selector_key is defined and expected_route_selector_key | length > 0
+
+    - name: Validar que IngressController está Available
+      ansible.builtin.assert:
+        that:
+          - ic.status.conditions
+            | selectattr('type', 'equalto', 'Available')
+            | selectattr('status', 'equalto', 'True')
+            | list | length > 0
+        fail_msg: "IngressController '{{ ingress_controller_name }}' NÃO está Available"
+        success_msg: "IngressController '{{ ingress_controller_name }}' está Available"

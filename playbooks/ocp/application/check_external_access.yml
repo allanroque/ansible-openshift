@@ -1,0 +1,86 @@
+---
+# =============================================================================
+# Health Check: Acesso Externo (Akamai/CDN)
+# Valida acessibilidade via URL pública e presença de headers CDN
+# =============================================================================
+- name: Health Check — Acesso Externo (CDN)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/main.yml
+
+  tasks:
+    # -----------------------------------------------------------------
+    # 1. Validar que URL externa responde
+    # -----------------------------------------------------------------
+    - name: Validar endpoint externo via CDN
+      ansible.builtin.uri:
+        url: "{{ external_url }}"
+        method: GET
+        return_content: false
+        validate_certs: true
+        timeout: "{{ external_timeout }}"
+        status_code: "{{ expected_external_http_status }}"
+        follow_redirects: safe
+      register: external_response
+
+    - name: Exibir resultado do acesso externo
+      ansible.builtin.debug:
+        msg: "Endpoint {{ external_url }} retornou HTTP {{ external_response.status }}"
+
+    # -----------------------------------------------------------------
+    # 2. Validar presença de header CDN (confirma passagem pelo CDN)
+    # -----------------------------------------------------------------
+    - name: Validar presença do header CDN
+      ansible.builtin.assert:
+        that:
+          - cdn_header_name in external_response
+            or external_response[cdn_header_name | lower] is defined
+        fail_msg: >-
+          Header '{{ cdn_header_name }}' NÃO encontrado na resposta.
+          O tráfego pode não estar passando pelo CDN.
+          Headers recebidos: {{ external_response.keys() | list }}
+        success_msg: >-
+          Header CDN '{{ cdn_header_name }}' presente na resposta
+      when: cdn_header_name | length > 0
+      ignore_errors: true
+
+    # -----------------------------------------------------------------
+    # 3. Comparar resposta interna vs externa
+    # -----------------------------------------------------------------
+    - name: Validar endpoint interno para comparação
+      ansible.builtin.uri:
+        url: "{{ app_url }}"
+        method: GET
+        return_content: false
+        validate_certs: true
+        status_code: "{{ expected_http_status }}"
+      register: internal_response
+      when: app_url != external_url
+
+    - name: Comparar status interno vs externo
+      ansible.builtin.assert:
+        that:
+          - internal_response.status == external_response.status
+        fail_msg: >-
+          Divergência de status: interno={{ internal_response.status }},
+          externo={{ external_response.status }}.
+          Possível problema no CDN/proxy reverso.
+        success_msg: >-
+          Status consistente: interno={{ internal_response.status }},
+          externo={{ external_response.status }}
+      when:
+        - app_url != external_url
+        - internal_response is not skipped
+
+    # -----------------------------------------------------------------
+    # 4. Resumo
+    # -----------------------------------------------------------------
+    - name: Resumo do acesso externo
+      ansible.builtin.debug:
+        msg:
+          - "URL externa: {{ external_url }}"
+          - "Status HTTP: {{ external_response.status }}"
+          - "CDN header ({{ cdn_header_name }}): {{ external_response[cdn_header_name | lower] | default('não encontrado') }}"

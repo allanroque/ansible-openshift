@@ -1,0 +1,50 @@
+---
+# =============================================================================
+# Health Check: External Secrets Operator (ESO)
+# Valida que ExternalSecret está sincronizado
+# =============================================================================
+- name: Health Check — External Secrets (ESO)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/main.yml
+
+  tasks:
+    - name: Obter ExternalSecret
+      kubernetes.core.k8s_info:
+        api_version: external-secrets.io/v1beta1
+        kind: ExternalSecret
+        name: "{{ external_secret_name }}"
+        namespace: "{{ external_secret_namespace }}"
+      register: external_secret
+
+    - name: Validar que ExternalSecret existe
+      ansible.builtin.assert:
+        that:
+          - external_secret.resources | length > 0
+        fail_msg: >-
+          ExternalSecret '{{ external_secret_name }}' não encontrado
+          no namespace '{{ external_secret_namespace }}'
+        success_msg: >-
+          ExternalSecret '{{ external_secret_name }}' encontrado
+          no namespace '{{ external_secret_namespace }}'
+
+    - name: Extrair ExternalSecret
+      ansible.builtin.set_fact:
+        es: "{{ external_secret.resources[0] }}"
+
+    - name: Validar que ExternalSecret está sincronizado (SecretSynced)
+      ansible.builtin.assert:
+        that:
+          - es.status is defined
+          - es.status.conditions is defined
+          - es.status.conditions
+            | selectattr('type', 'equalto', 'Ready')
+            | selectattr('status', 'equalto', 'True')
+            | list | length > 0
+        fail_msg: >-
+          ExternalSecret '{{ external_secret_name }}' NÃO está sincronizado.
+          Conditions: {{ es.status.conditions | default('não disponível') }}
+        success_msg: "ExternalSecret '{{ external_secret_name }}' está sincronizado"

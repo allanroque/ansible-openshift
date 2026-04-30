@@ -1,0 +1,65 @@
+---
+# =============================================================================
+# Health Check: Routes e Endpoint HTTP
+# Valida que Route existe e endpoint responde HTTP 200
+# =============================================================================
+- name: Health Check — Routes e Endpoint
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/main.yml
+
+  tasks:
+    - name: Obter Route da aplicação
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: "{{ app_route_name }}"
+        namespace: "{{ app_route_namespace }}"
+      register: app_route
+
+    - name: Validar que Route existe
+      ansible.builtin.assert:
+        that:
+          - app_route.resources | length > 0
+        fail_msg: >-
+          Route '{{ app_route_name }}' não encontrada
+          no namespace '{{ app_route_namespace }}'
+        success_msg: >-
+          Route '{{ app_route_name }}' encontrada
+          no namespace '{{ app_route_namespace }}'
+
+    - name: Extrair hostname da Route
+      ansible.builtin.set_fact:
+        route_host: "{{ app_route.resources[0].spec.host }}"
+
+    - name: Exibir hostname da Route
+      ansible.builtin.debug:
+        msg: "Route hostname: {{ route_host }}"
+
+    - name: Validar que Route foi admitida pelo router
+      ansible.builtin.assert:
+        that:
+          - app_route.resources[0].status.ingress is defined
+          - app_route.resources[0].status.ingress | length > 0
+          - app_route.resources[0].status.ingress[0].conditions
+            | selectattr('type', 'equalto', 'Admitted')
+            | selectattr('status', 'equalto', 'True')
+            | list | length > 0
+        fail_msg: "Route '{{ app_route_name }}' NÃO foi admitida pelo router"
+        success_msg: "Route '{{ app_route_name }}' foi admitida pelo router"
+
+    - name: Validar endpoint HTTP da aplicação
+      ansible.builtin.uri:
+        url: "{{ app_url }}"
+        method: GET
+        validate_certs: true
+        return_content: false
+        status_code: "{{ expected_http_status }}"
+      register: http_response
+
+    - name: Exibir resultado do endpoint
+      ansible.builtin.debug:
+        msg: "Endpoint {{ app_url }} retornou HTTP {{ http_response.status }}"

@@ -1,0 +1,70 @@
+---
+# =============================================================================
+# Variáveis para Health Check OCP — preparadas para Survey no AAP
+# =============================================================================
+
+# --- Infraestrutura ---
+# Quantidade mínima de worker nodes esperados
+expected_worker_count: 3
+
+# Agentes obrigatórios (lista de namespaces e labels)
+required_agents:
+  - name: dynatrace
+    namespace: dynatrace
+    label_selector: "app.kubernetes.io/name=dynatrace-operator"
+  - name: fluent-bit
+    namespace: openshift-logging
+    label_selector: "app.kubernetes.io/name=fluent-bit"
+
+# --- Rede / Segurança (L7) ---
+# Route Sharding
+expected_route_domain: "apps.example.com"
+ingress_controller_name: "default"
+expected_route_selector_key: "type"
+expected_route_selector_value: "sharded"
+
+# --- Aplicação ---
+# Namespace da aplicação
+app_namespace: "my-app"
+
+# Banco de dados — Secret
+db_secret_name: "db-credentials"
+db_secret_namespace: "{{ app_namespace }}"
+
+# External Secrets Operator (ESO)
+external_secret_name: "my-app-secrets"
+external_secret_namespace: "{{ app_namespace }}"
+
+# Routes / Ingress
+app_route_name: "my-app"
+app_route_namespace: "{{ app_namespace }}"
+
+# Endpoint HTTP para validação
+app_url: "https://my-app.apps.example.com"
+expected_http_status: 200
+
+# --- Certificados SSL ---
+# Route cujo certificado será validado
+certificate_route_name: "{{ app_route_name }}"
+certificate_route_namespace: "{{ app_route_namespace }}"
+# CN esperado no certificado (deixar vazio para pular validação de CN)
+expected_certificate_cn: "my-app.apps.example.com"
+# Dias mínimos antes da expiração para considerar válido
+certificate_min_days_remaining: 30
+
+# --- Headers / Segurança ---
+# URL para testar manipulação de headers
+header_test_url: "{{ app_url }}"
+# Valor forjado para x-forwarded-host
+forged_forwarded_host: "malicious.example.com"
+# Status HTTP esperado quando header é manipulado (403 = bloqueado, 200 = não bloqueado)
+expected_blocked_status: 403
+
+# --- Acesso Externo (Akamai/CDN) ---
+# URL pública acessível via CDN/Akamai
+external_url: "https://my-app.example.com"
+expected_external_http_status: 200
+# Timeout em segundos para validação externa
+external_timeout: 30
+# Header esperado que confirma passagem pelo CDN (ex: X-Cache, X-Akamai-Request-ID)
+cdn_header_name: "X-Cache"

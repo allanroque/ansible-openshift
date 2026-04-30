@@ -1,0 +1,39 @@
+---
+# =============================================================================
+# Health Check: Database Secret
+# Valida que o Secret do banco de dados existe e contém as chaves esperadas
+# =============================================================================
+- name: Health Check — Database Secret
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/main.yml
+
+  tasks:
+    - name: Obter Secret do banco de dados
+      kubernetes.core.k8s_info:
+        kind: Secret
+        name: "{{ db_secret_name }}"
+        namespace: "{{ db_secret_namespace }}"
+      register: db_secret
+
+    - name: Validar que Secret do banco existe
+      ansible.builtin.assert:
+        that:
+          - db_secret.resources | length > 0
+        fail_msg: >-
+          Secret '{{ db_secret_name }}' não encontrado
+          no namespace '{{ db_secret_namespace }}'
+        success_msg: >-
+          Secret '{{ db_secret_name }}' encontrado
+          no namespace '{{ db_secret_namespace }}'
+
+    - name: Validar que Secret contém dados
+      ansible.builtin.assert:
+        that:
+          - db_secret.resources[0].data is defined
+          - db_secret.resources[0].data | length > 0
+        fail_msg: "Secret '{{ db_secret_name }}' existe mas está vazio"
+        success_msg: "Secret '{{ db_secret_name }}' contém {{ db_secret.resources[0].data | length }} chave(s)"

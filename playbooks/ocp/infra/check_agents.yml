@@ -1,0 +1,45 @@
+---
+# =============================================================================
+# Health Check: Agentes Obrigatórios
+# Valida que Dynatrace e Fluent Bit estão rodando nos namespaces corretos
+# =============================================================================
+- name: Health Check — Agentes Obrigatórios
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ../vars/main.yml
+
+  tasks:
+    - name: "Verificar agente: {{ agent.name }}"
+      block:
+        - name: "Obter pods do agente {{ agent.name }}"
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: "{{ agent.namespace }}"
+            label_selectors:
+              - "{{ agent.label_selector }}"
+          register: agent_pods
+
+        - name: "Validar que existem pods do {{ agent.name }}"
+          ansible.builtin.assert:
+            that:
+              - agent_pods.resources | length > 0
+            fail_msg: "Nenhum pod encontrado para {{ agent.name }} no namespace {{ agent.namespace }}"
+            success_msg: "{{ agent_pods.resources | length }} pod(s) encontrado(s) para {{ agent.name }}"
+
+        - name: "Validar que pods do {{ agent.name }} estão Running"
+          ansible.builtin.assert:
+            that:
+              - item.status.phase == 'Running'
+            fail_msg: "Pod {{ item.metadata.name }} do {{ agent.name }} está {{ item.status.phase }}, esperado Running"
+            success_msg: "Pod {{ item.metadata.name }} do {{ agent.name }} está Running"
+          loop: "{{ agent_pods.resources }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+
+      loop: "{{ required_agents }}"
+      loop_control:
+        loop_var: agent
+        label: "{{ agent.name }}"
