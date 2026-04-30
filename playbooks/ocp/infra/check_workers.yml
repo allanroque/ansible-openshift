@@ -56,3 +56,61 @@
       loop: "{{ worker_nodes }}"
       loop_control:
         label: "{{ item.metadata.name }}"
+
+    # =========================================================================
+    # Coleta de dados para o relatório final
+    # =========================================================================
+    - name: Obter ClusterVersion (versão do OCP)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: ClusterVersion
+        name: version
+      register: cluster_version
+      failed_when: false
+
+    - name: Obter Infrastructure (provider, region)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+      register: infrastructure
+      failed_when: false
+
+    - name: Contar namespaces
+      kubernetes.core.k8s_info:
+        kind: Namespace
+      register: namespaces
+
+    - name: Contar deployments (proxy para # de aplicações)
+      kubernetes.core.k8s_info:
+        kind: Deployment
+      register: deployments
+
+    - name: Relatório final do Health Check
+      ansible.builtin.debug:
+        msg: |
+          ========================== HEALTH CHECK REPORT ==========================
+          Cluster Name       : {{ infrastructure.resources[0].status.infrastructureName | default('N/A') }}
+          OCP Version        : {{ cluster_version.resources[0].status.desired.version | default('N/A') }}
+          Channel            : {{ cluster_version.resources[0].spec.channel | default('N/A') }}
+          Platform           : {{ infrastructure.resources[0].status.platform | default('N/A') }}
+          API Server URL     : {{ infrastructure.resources[0].status.apiServerURL | default('N/A') }}
+          --------------------------------------------------------------------------
+          Topologia          : {{ topology_mode }}
+          Total Nodes        : {{ all_nodes.resources | length }}
+          Worker Nodes       : {{ worker_nodes | length }}
+          Namespaces         : {{ namespaces.resources | length }}
+          Deployments        : {{ deployments.resources | length }}
+          --------------------------------------------------------------------------
+          Detalhe dos Workers:
+          {% for node in worker_nodes %}
+            - {{ node.metadata.name }}
+                Ready    : {{ (node.status.conditions | selectattr('type', 'equalto', 'Ready') | list | first).status }}
+                OS Image : {{ node.status.nodeInfo.osImage | default('N/A') }}
+                Kernel   : {{ node.status.nodeInfo.kernelVersion | default('N/A') }}
+                Kubelet  : {{ node.status.nodeInfo.kubeletVersion | default('N/A') }}
+                Runtime  : {{ node.status.nodeInfo.containerRuntimeVersion | default('N/A') }}
+                CPU      : {{ node.status.capacity.cpu | default('N/A') }}
+                Memory   : {{ node.status.capacity.memory | default('N/A') }}
+          {% endfor %}
+          ==========================================================================
