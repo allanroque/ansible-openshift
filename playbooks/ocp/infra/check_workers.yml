@@ -17,17 +17,25 @@
         kind: Node
       register: all_nodes
 
-    - name: Filtrar worker nodes
+    - name: Identificar workers explícitos (label node-role.kubernetes.io/worker)
       ansible.builtin.set_fact:
-        worker_nodes: >-
+        explicit_workers: >-
           {{ all_nodes.resources
              | selectattr('metadata.labels', 'defined')
              | selectattr('metadata.labels.node-role.kubernetes.io/worker', 'defined')
              | list }}
 
+    - name: Definir worker_nodes (fallback p/ todos os nodes em clusters compact/SNO)
+      ansible.builtin.set_fact:
+        worker_nodes: "{{ explicit_workers if explicit_workers | length > 0 else all_nodes.resources }}"
+        topology_mode: "{{ 'standard' if explicit_workers | length > 0 else 'compact-or-sno' }}"
+
     - name: Exibir worker nodes encontrados
       ansible.builtin.debug:
-        msg: "Workers encontrados ({{ worker_nodes | length }}): {{ worker_nodes | map(attribute='metadata.name') | list }}"
+        msg: >-
+          Topologia: {{ topology_mode }} —
+          {{ worker_nodes | length }} node(s):
+          {{ worker_nodes | map(attribute='metadata.name') | list }}
 
     - name: Garantir que existe pelo menos um worker node
       ansible.builtin.assert:
