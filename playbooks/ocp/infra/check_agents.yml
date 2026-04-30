@@ -1,7 +1,8 @@
 ---
 # =============================================================================
-# Health Check: Agentes Obrigatórios
-# Valida que Dynatrace e Fluent Bit estão rodando nos namespaces corretos
+# Health Check: Agentes Obrigatórios (Dynatrace, Fluent Bit, ...)
+# Faz discovery em múltiplos namespaces/labels e reporta status de instalação.
+# Falha apenas se um agente com enforce=true NÃO estiver instalado.
 # =============================================================================
 - name: Health Check — Agentes Obrigatórios
   hosts: localhost
@@ -12,7 +13,11 @@
     - ../vars/main.yml
 
   tasks:
-    - name: Verificar cada agente obrigatório
+    - name: Inicializar lista de resultados
+      ansible.builtin.set_fact:
+        agent_results: []
+
+    - name: Verificar cada agente
       ansible.builtin.include_tasks: tasks/check_single_agent.yml
       loop: "{{ required_agents }}"
       loop_control:
@@ -23,12 +28,28 @@
       ansible.builtin.debug:
         msg: |
           ========================== AGENTS HEALTH REPORT ==========================
-          Total de agentes verificados : {{ agent_results | length }}
-          --------------------------------------------------------------------------
           {% for r in agent_results %}
-          Agente   : {{ r.name }}
-            Namespace : {{ r.namespace }}
-            Pods      : {{ r.pod_count }} ({{ 'todos Running' if r.all_running else 'NEM TODOS Running' }})
-            Lista     : {{ r.pods }}
+          Agente : {{ r.name }}
+            Status     : {{ 'INSTALADO' if r.installed else 'NÃO INSTALADO' }}
+            Enforcement: {{ 'enforce=true (falha se ausente)' if r.enforced else 'enforce=false (apenas reporta)' }}
+          {% if r.installed %}
+            Namespaces : {{ r.namespaces }}
+            Pods       : {{ r.pod_count }} ({{ 'todos Running' if r.all_running else 'NEM TODOS Running' }})
+            Lista      : {{ r.pods }}
+          {% endif %}
           {% endfor %}
           ==========================================================================
+
+    - name: Falhar se algum agente com enforce=true NÃO está instalado
+      ansible.builtin.assert:
+        that:
+          - item.installed
+          - item.all_running
+        fail_msg: >-
+          Agente obrigatório '{{ item.name }}' NÃO está instalado
+          (ou tem pods fora de Running). Defina enforce_{{ item.name | replace('-', '_') }}=false
+          via Survey para tolerar a ausência.
+        success_msg: "Agente '{{ item.name }}' instalado e saudável"
+      loop: "{{ agent_results | selectattr('enforced') | list }}"
+      loop_control:
+        label: "{{ item.name }}"

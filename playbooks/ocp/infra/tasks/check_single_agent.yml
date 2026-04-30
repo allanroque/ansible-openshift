@@ -1,41 +1,46 @@
 ---
 # =============================================================================
-# Tasks para validação de um único agente
-# Espera as variáveis: agent.name, agent.namespace, agent.label_selector
+# Tasks para discovery de um único agente
+# Espera as variáveis:
+#   agent.name         — nome lógico (dynatrace, fluent-bit, ...)
+#   agent.enforce      — bool: true falha se não instalado, false apenas reporta
+#   agent.detection    — lista de {namespace, label_selector} a tentar
 # Acumula resultado em agent_results (lista de dicts)
 # =============================================================================
-- name: "Obter pods do agente {{ agent.name }}"
+- name: "Procurar pods do {{ agent.name }} em locais conhecidos"
   kubernetes.core.k8s_info:
     kind: Pod
-    namespace: "{{ agent.namespace }}"
+    namespace: "{{ candidate.namespace }}"
     label_selectors:
-      - "{{ agent.label_selector }}"
-  register: agent_pods
-
-- name: "Validar que existem pods do {{ agent.name }}"
-  ansible.builtin.assert:
-    that:
-      - agent_pods.resources | length > 0
-    fail_msg: "Nenhum pod encontrado para {{ agent.name }} no namespace {{ agent.namespace }}"
-    success_msg: "{{ agent_pods.resources | length }} pod(s) encontrado(s) para {{ agent.name }}"
-
-- name: "Validar que pods do {{ agent.name }} estão Running"
-  ansible.builtin.assert:
-    that:
-      - item.status.phase == 'Running'
-    fail_msg: "Pod {{ item.metadata.name }} do {{ agent.name }} está {{ item.status.phase }}, esperado Running"
-    success_msg: "Pod {{ item.metadata.name }} do {{ agent.name }} está Running"
-  loop: "{{ agent_pods.resources }}"
+      - "{{ candidate.label_selector }}"
+  register: pod_search
+  loop: "{{ agent.detection }}"
   loop_control:
-    label: "{{ item.metadata.name }}"
+    loop_var: candidate
+    label: "{{ candidate.namespace }} / {{ candidate.label_selector }}"
+  failed_when: false
+
+- name: "Agregar pods encontrados de todos os candidatos para {{ agent.name }}"
+  ansible.builtin.set_fact:
+    found_pods: >-
+      {{ pod_search.results
+         | map(attribute='resources')
+         | map('default', [], true)
+         | sum(start=[]) }}
 
 - name: "Acumular resultado do {{ agent.name }} no relatório"
   ansible.builtin.set_fact:
     agent_results: "{{ agent_results | default([]) + [single_result] }}"
   vars:
+    pod_namespaces: "{{ found_pods | map(attribute='metadata.namespace') | list | unique }}"
+    phases: "{{ found_pods | map(attribute='status.phase') | list }}"
+    is_installed: "{{ found_pods | length > 0 }}"
+    all_running: "{{ is_installed and (phases | unique == ['Running']) }}"
     single_result:
       name: "{{ agent.name }}"
-      namespace: "{{ agent.namespace }}"
-      pod_count: "{{ agent_pods.resources | length }}"
-      pods: "{{ agent_pods.resources | map(attribute='metadata.name') | list }}"
-      all_running: "{{ agent_pods.resources | map(attribute='status.phase') | list | unique == ['Running'] }}"
+      enforced: "{{ agent.enforce | bool }}"
+      installed: "{{ is_installed }}"
+      pod_count: "{{ found_pods | length }}"
+      namespaces: "{{ pod_namespaces }}"
+      pods: "{{ found_pods | map(attribute='metadata.name') | list }}"
+      all_running: "{{ all_running }}"

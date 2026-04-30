@@ -4,14 +4,35 @@
 # =============================================================================
 
 # --- Infraestrutura ---
-# Agentes obrigatórios (lista de namespaces e labels)
+# Controle de enforcement por agente — sobrescritível via Survey no AAP.
+# true  = falha o playbook se o agente NÃO estiver instalado
+# false = apenas reporta no relatório final, sem falhar
+enforce_dynatrace: true
+enforce_fluent_bit: true
+
+# Agentes obrigatórios — cada agente tem múltiplos padrões de detecção
+# (operator, helm, daemonset, etc) para cobrir formas diferentes de instalação
 required_agents:
   - name: dynatrace
-    namespace: dynatrace
-    label_selector: "app.kubernetes.io/name=dynatrace-operator"
+    enforce: "{{ enforce_dynatrace | bool }}"
+    detection:
+      - namespace: dynatrace
+        label_selector: "app.kubernetes.io/name=dynatrace-operator"
+      - namespace: dynatrace
+        label_selector: "app.kubernetes.io/managed-by=dynatrace-operator"
+      - namespace: dynatrace
+        label_selector: "internal.oneagent.dynatrace.com/component=oneagent"
+      - namespace: dynatrace-system
+        label_selector: "app.kubernetes.io/name=dynatrace-operator"
   - name: fluent-bit
-    namespace: openshift-logging
-    label_selector: "app.kubernetes.io/name=fluent-bit"
+    enforce: "{{ enforce_fluent_bit | bool }}"
+    detection:
+      - namespace: openshift-logging
+        label_selector: "app.kubernetes.io/name=fluent-bit"
+      - namespace: openshift-logging
+        label_selector: "component=fluent-bit"
+      - namespace: openshift-logging
+        label_selector: "k8s-app=fluentbit"
 
 # --- Rede / Segurança (L7) ---
 # Route Sharding
