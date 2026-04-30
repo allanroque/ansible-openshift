@@ -24,10 +24,29 @@
         loop_var: agent
         label: "{{ agent.name }}"
 
+    - name: Obter Infrastructure (nome do cluster)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+      register: infrastructure
+      failed_when: false
+
+    - name: Calcular agentes faltantes (enforce=true e não instalados)
+      ansible.builtin.set_fact:
+        cluster_name: "{{ infrastructure.resources[0].status.infrastructureName | default('unknown') }}"
+        missing_agents: >-
+          {{ agent_results
+             | selectattr('enforced')
+             | rejectattr('installed')
+             | list }}
+
     - name: Relatório final dos agentes
       ansible.builtin.debug:
         msg: |
           ========================== AGENTS HEALTH REPORT ==========================
+          Cluster : {{ cluster_name }}
+          --------------------------------------------------------------------------
           {% for r in agent_results %}
           Agente : {{ r.name }}
             Status     : {{ 'INSTALADO' if r.installed else 'NÃO INSTALADO' }}
@@ -39,6 +58,40 @@
           {% endif %}
           {% endfor %}
           ==========================================================================
+
+    # =========================================================================
+    # Publica artefatos para o próximo job do workflow (ex: criar incidente
+    # no ServiceNow). set_stats roda ANTES do assert para garantir que as
+    # variáveis sejam propagadas mesmo se este job falhar.
+    # =========================================================================
+    - name: Publicar artefatos para o próximo job do workflow (ServiceNow)
+      ansible.builtin.set_stats:
+        data:
+          incident_required: "{{ missing_agents | length > 0 }}"
+          cluster_name: "{{ cluster_name }}"
+          missing_agents_list: "{{ missing_agents | map(attribute='name') | list }}"
+          sn_short_description: >-
+            {%- if missing_agents | length > 0 -%}
+            [OCP {{ cluster_name }}] Agente(s) obrigatório(s) não instalado(s):
+            {{ missing_agents | map(attribute='name') | list | join(', ') }}
+            {%- else -%}
+            [OCP {{ cluster_name }}] Todos os agentes obrigatórios estão instalados
+            {%- endif -%}
+          sn_description: |-
+            Cluster: {{ cluster_name }}
+            {% if missing_agents | length > 0 %}
+            Componentes obrigatórios NÃO instalados:
+            {% for a in missing_agents %}
+            - {{ a.name }}
+            {% endfor %}
+
+            Ação: validar instalação dos agentes acima no cluster {{ cluster_name }}.
+            {% else %}
+            Todos os agentes obrigatórios foram detectados e estão saudáveis.
+            {% endif %}
+            Verificação executada via AAP (Health Check OCP).
+          sn_impact: "medium"
+          sn_urgency: "medium"
 
     - name: Falhar se algum agente com enforce=true NÃO está instalado
       ansible.builtin.assert:
