@@ -1,0 +1,83 @@
+---
+# =============================================================================
+# Avalia uma única Route: status Admitted + HTTP test opcional.
+# Espera: rt (a Route), route_test_http (bool), route_http_timeout (int).
+# Acumula em route_report (lista de dicts).
+# =============================================================================
+- name: "Determinar admitted status de {{ rt.metadata.namespace }}/{{ rt.metadata.name }}"
+  ansible.builtin.set_fact:
+    rt_host: "{{ rt.spec.host | default('') }}"
+    rt_tls: "{{ rt.spec.tls.termination | default('') }}"
+    rt_url: "{{ ('https://' if rt.spec.tls is defined else 'http://') ~ (rt.spec.host | default('')) }}"
+    rt_admitted: >-
+      {{ ((rt.status.ingress | default([]))[0].conditions | default([]))
+         | selectattr('type', 'equalto', 'Admitted')
+         | selectattr('status', 'equalto', 'True')
+         | list | length > 0 }}
+    rt_http_tested: false
+    rt_http_status: ""
+    rt_http_msg: ""
+
+- name: "HTTP test em {{ rt_url }}"
+  when:
+    - route_test_http | bool
+    - rt_admitted
+    - rt_host | length > 0
+  block:
+    - name: "GET {{ rt_url }}"
+      ansible.builtin.uri:
+        url: "{{ rt_url }}"
+        method: GET
+        return_content: false
+        validate_certs: true
+        timeout: "{{ route_http_timeout | int }}"
+        status_code: [200, 201, 204, 301, 302, 307, 308, 400, 401, 403, 404]
+      register: http_result
+      failed_when: false
+
+    - name: "Capturar resultado HTTP"
+      ansible.builtin.set_fact:
+        rt_http_tested: true
+        rt_http_status: "{{ http_result.status | default('') }}"
+        rt_http_msg: "{{ http_result.msg | default('') }}"
+
+- name: "Computar status final da route"
+  ansible.builtin.set_fact:
+    rt_final_status: >-
+      {%- if not rt_admitted -%}
+      NOT_ADMITTED
+      {%- elif not rt_http_tested -%}
+      ADMITTED
+      {%- elif rt_http_status in ['', none] -%}
+      HTTP_UNREACHABLE
+      {%- elif (rt_http_status | int) >= 500 -%}
+      HTTP_5XX
+      {%- elif (rt_http_status | int) >= 400 -%}
+      HTTP_4XX
+      {%- else -%}
+      HTTP_OK
+      {%- endif -%}
+    rt_issue: >-
+      {%- if not rt_admitted -%}
+      Route NÃO foi admitida pelo router
+      {%- elif rt_http_tested and rt_http_status in ['', none] -%}
+      Falha de conexão: {{ rt_http_msg }}
+      {%- elif rt_http_tested and (rt_http_status | int) >= 500 -%}
+      Backend retornou {{ rt_http_status }}: {{ rt_http_msg }}
+      {%- else -%}{%- endif -%}
+
+- name: "Acumular no relatório"
+  ansible.builtin.set_fact:
+    route_report: "{{ route_report + [entry] }}"
+  vars:
+    entry:
+      namespace: "{{ rt.metadata.namespace }}"
+      name: "{{ rt.metadata.name }}"
+      host: "{{ rt_host }}"
+      url: "{{ rt_url }}"
+      tls: "{{ rt_tls }}"
+      admitted: "{{ rt_admitted }}"
+      http_tested: "{{ rt_http_tested }}"
+      http_status: "{{ rt_http_status }}"
+      status: "{{ rt_final_status }}"
+      issue: "{{ rt_issue }}"

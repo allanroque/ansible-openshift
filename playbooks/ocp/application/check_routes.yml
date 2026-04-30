@@ -1,9 +1,11 @@
 ---
 # =============================================================================
-# Health Check: Routes e Endpoint HTTP
-# Valida que Route existe e endpoint responde HTTP 200
+# Health Check: Routes (cluster-wide scan)
+# Lê todas as Routes do cluster e classifica cada uma:
+#   ADMITTED | NOT_ADMITTED | HTTP_OK | HTTP_4XX | HTTP_5XX | HTTP_UNREACHABLE
+# Publica artefatos via set_stats para o próximo job do workflow (ServiceNow).
 # =============================================================================
-- name: Health Check — Routes e Endpoint
+- name: Health Check — Routes (cluster-wide)
   hosts: localhost
   connection: local
   gather_facts: false
@@ -12,54 +14,135 @@
     - ../vars/main.yml
 
   tasks:
-    - name: Obter Route da aplicação
+    - name: Obter Infrastructure (nome do cluster)
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: Infrastructure
+        name: cluster
+      register: infrastructure
+      failed_when: false
+
+    - name: Obter Routes (cluster-wide ou por namespace)
       kubernetes.core.k8s_info:
         api_version: route.openshift.io/v1
         kind: Route
-        name: "{{ app_route_name }}"
-        namespace: "{{ app_route_namespace }}"
-      register: app_route
+        namespace: "{{ route_namespace_filter if (route_namespace_filter | length > 0) else omit }}"
+      register: all_routes
 
-    - name: Validar que Route existe
-      ansible.builtin.assert:
-        that:
-          - app_route.resources | length > 0
-        fail_msg: >-
-          Route '{{ app_route_name }}' não encontrada
-          no namespace '{{ app_route_namespace }}'
-        success_msg: >-
-          Route '{{ app_route_name }}' encontrada
-          no namespace '{{ app_route_namespace }}'
-
-    - name: Extrair hostname da Route
+    - name: Filtrar routes (excluir namespaces de sistema se configurado)
       ansible.builtin.set_fact:
-        route_host: "{{ app_route.resources[0].spec.host }}"
+        cluster_name: "{{ infrastructure.resources[0].status.infrastructureName | default('unknown') }}"
+        candidate_routes: >-
+          {{ all_routes.resources
+             | rejectattr('metadata.namespace', 'match',
+                          '^(openshift|kube|default)([-.]|$)'
+                          if (route_exclude_system_namespaces | bool)
+                          else '$.^')
+             | list }}
+        route_report: []
 
-    - name: Exibir hostname da Route
+    - name: Avaliar cada route
+      ansible.builtin.include_tasks: tasks/check_single_route.yml
+      loop: "{{ candidate_routes }}"
+      loop_control:
+        loop_var: rt
+        label: "{{ rt.metadata.namespace }}/{{ rt.metadata.name }}"
+
+    - name: Calcular routes com problema (NOT_ADMITTED, HTTP_5XX, HTTP_UNREACHABLE)
+      ansible.builtin.set_fact:
+        problematic: >-
+          {{ route_report
+             | selectattr('status', 'in',
+                          ['NOT_ADMITTED', 'HTTP_5XX', 'HTTP_UNREACHABLE'])
+             | list }}
+
+    - name: Calcular contagens por status
+      ansible.builtin.set_fact:
+        count_admitted: "{{ route_report | selectattr('status','equalto','ADMITTED') | list | length }}"
+        count_not_admitted: "{{ route_report | selectattr('status','equalto','NOT_ADMITTED') | list | length }}"
+        count_http_ok: "{{ route_report | selectattr('status','equalto','HTTP_OK') | list | length }}"
+        count_http_4xx: "{{ route_report | selectattr('status','equalto','HTTP_4XX') | list | length }}"
+        count_http_5xx: "{{ route_report | selectattr('status','equalto','HTTP_5XX') | list | length }}"
+        count_http_unreachable: "{{ route_report | selectattr('status','equalto','HTTP_UNREACHABLE') | list | length }}"
+
+    - name: Relatório final das Routes
       ansible.builtin.debug:
-        msg: "Route hostname: {{ route_host }}"
+        msg: |
+          ================ ROUTES HEALTH REPORT ================
+          Cluster              : {{ cluster_name }}
+          Namespace filter     : {{ route_namespace_filter | default('(todos)') or '(todos)' }}
+          Excluir system NS    : {{ route_exclude_system_namespaces }}
+          HTTP test ativado    : {{ route_test_http }}
+          Routes analisadas    : {{ route_report | length }}
+          ------------------------------------------------------
+          ADMITTED          : {{ count_admitted }}  (admitidas, sem teste HTTP)
+          NOT_ADMITTED      : {{ count_not_admitted }}
+          HTTP_OK           : {{ count_http_ok }}
+          HTTP_4XX          : {{ count_http_4xx }}  (informativo: route up, 4xx)
+          HTTP_5XX          : {{ count_http_5xx }}  (problema: backend)
+          HTTP_UNREACHABLE  : {{ count_http_unreachable }}  (problema: conexão)
+          ------------------------------------------------------
+          {% for r in route_report %}
+          [{{ r.status }}] {{ r.namespace }}/{{ r.name }}
+            Host       : {{ r.host }}
+            URL        : {{ r.url }}
+            TLS        : {{ r.tls or '(none)' }}
+            Admitted   : {{ r.admitted }}
+          {% if r.http_tested %}
+            HTTP status: {{ r.http_status }}
+          {% endif %}
+          {% if r.issue %}
+            Issue      : {{ r.issue }}
+          {% endif %}
+          {% endfor %}
+          ======================================================
 
-    - name: Validar que Route foi admitida pelo router
+    - name: Publicar artefatos para o próximo job do workflow (ServiceNow)
+      ansible.builtin.set_stats:
+        data:
+          incident_required: "{{ problematic | length > 0 }}"
+          cluster_name: "{{ cluster_name }}"
+          problematic_routes: >-
+            {{ problematic | map(attribute='namespace')
+               | zip(problematic | map(attribute='name'))
+               | map('join', '/') | list }}
+          sn_short_description: >-
+            {%- if problematic | length > 0 -%}
+            [OCP {{ cluster_name }}] {{ problematic | length }} route(s) com problema
+            {%- else -%}
+            [OCP {{ cluster_name }}] Routes OK ({{ route_report | length }} validadas)
+            {%- endif -%}
+          sn_description: |-
+            Cluster: {{ cluster_name }}
+            Total de routes: {{ route_report | length }}
+            HTTP test ativado: {{ route_test_http }}
+            Resumo:
+              ADMITTED: {{ count_admitted }} | NOT_ADMITTED: {{ count_not_admitted }}
+              HTTP_OK: {{ count_http_ok }} | HTTP_4XX: {{ count_http_4xx }}
+              HTTP_5XX: {{ count_http_5xx }} | HTTP_UNREACHABLE: {{ count_http_unreachable }}
+            {% if problematic | length > 0 %}
+
+            Routes com problema:
+            {% for r in problematic %}
+            - [{{ r.status }}] {{ r.namespace }}/{{ r.name }}
+              Host: {{ r.host }}
+              {% if r.issue %}{{ r.issue }}{% endif %}
+            {% endfor %}
+
+            Ação: validar status do router e backends das routes acima.
+            {% else %}
+            Todas as routes admitidas e respondendo conforme esperado.
+            {% endif %}
+            Verificação executada via AAP (Health Check OCP).
+          sn_impact: "medium"
+          sn_urgency: "medium"
+
+    - name: Falhar se enforce=true e há routes com problema
       ansible.builtin.assert:
         that:
-          - app_route.resources[0].status.ingress is defined
-          - app_route.resources[0].status.ingress | length > 0
-          - app_route.resources[0].status.ingress[0].conditions
-            | selectattr('type', 'equalto', 'Admitted')
-            | selectattr('status', 'equalto', 'True')
-            | list | length > 0
-        fail_msg: "Route '{{ app_route_name }}' NÃO foi admitida pelo router"
-        success_msg: "Route '{{ app_route_name }}' foi admitida pelo router"
-
-    - name: Validar endpoint HTTP da aplicação
-      ansible.builtin.uri:
-        url: "{{ app_url }}"
-        method: GET
-        validate_certs: true
-        return_content: false
-        status_code: "{{ expected_http_status }}"
-      register: http_response
-
-    - name: Exibir resultado do endpoint
-      ansible.builtin.debug:
-        msg: "Endpoint {{ app_url }} retornou HTTP {{ http_response.status }}"
+          - problematic | length == 0
+        fail_msg: >-
+          {{ problematic | length }} route(s) com problema.
+          Veja o relatório acima.
+        success_msg: "Todas as routes estão saudáveis"
+      when: enforce_route_check | bool

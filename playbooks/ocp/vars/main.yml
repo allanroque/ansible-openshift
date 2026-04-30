@@ -56,11 +56,21 @@ db_secret_namespace: "{{ app_namespace }}"
 external_secret_name: "my-app-secrets"
 external_secret_namespace: "{{ app_namespace }}"
 
-# Routes / Ingress
+# Routes / Ingress (cluster-wide scan)
+# Filtrar por namespace específico (vazio = todos)
+route_namespace_filter: ""
+# Excluir namespaces de sistema (openshift-*, kube-*, default)
+route_exclude_system_namespaces: true
+# Fazer GET em cada route admitida? (lento — 1 req por route)
+route_test_http: false
+# Timeout em segundos por requisição HTTP
+route_http_timeout: 10
+# Se true, falha o playbook quando há routes com problema
+enforce_route_check: true
+
+# --- Aplicação específica (legado, usado por check_database/check_eso/etc) ---
 app_route_name: "my-app"
 app_route_namespace: "{{ app_namespace }}"
-
-# Endpoint HTTP para validação
 app_url: "https://my-app.apps.example.com"
 expected_http_status: 200
 
