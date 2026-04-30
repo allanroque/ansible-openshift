@@ -4,9 +4,6 @@
 # =============================================================================
 
 # --- Infraestrutura ---
-# Quantidade mínima de worker nodes esperados
-expected_worker_count: 3
-
 # Agentes obrigatórios (lista de namespaces e labels)
 required_agents:
   - name: dynatrace

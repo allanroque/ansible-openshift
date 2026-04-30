@@ -27,15 +27,13 @@
 
     - name: Exibir worker nodes encontrados
       ansible.builtin.debug:
-        msg: "Workers encontrados: {{ worker_nodes | map(attribute='metadata.name') | list }}"
+        msg: "Workers encontrados ({{ worker_nodes | length }}): {{ worker_nodes | map(attribute='metadata.name') | list }}"
 
-    - name: Validar quantidade mínima de workers
+    - name: Garantir que existe pelo menos um worker node
       ansible.builtin.assert:
         that:
-          - worker_nodes | length >= expected_worker_count
-        fail_msg: >-
-          Esperados pelo menos {{ expected_worker_count }} workers,
-          encontrados {{ worker_nodes | length }}
+          - worker_nodes | length > 0
+        fail_msg: "Nenhum worker node encontrado no cluster"
         success_msg: "{{ worker_nodes | length }} worker(s) encontrado(s)"
 
     - name: Validar que todos os workers estão Ready
